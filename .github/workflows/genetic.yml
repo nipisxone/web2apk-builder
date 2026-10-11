@@ -1,0 +1,700 @@
+# ==========================================
+# REY X BONTEN - Genetic Universal Builder
+# Support: Flutter / Native Android / WebView (HTML) → APK
+# SC bot contract:
+#   inputs: jobId, userId, payload (JSON)
+#   payload: url, assetApiUrl, buildType, tag, jobId, userId, kind
+#   artifact name: apk-${{ inputs.jobId }} path output/app.apk
+# ==========================================
+
+name: NIPZ X BONTEN - Genetic Universal Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: Build job ID from SC bot
+        required: true
+        type: string
+      userId:
+        description: Telegram user ID
+        required: false
+        default: "0"
+        type: string
+      payload:
+        description: JSON payload from SC bot
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: rey-genetic-${{ inputs.jobId }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      JOB_ID: ${{ inputs.jobId }}
+      USER_ID: ${{ inputs.userId }}
+      PAYLOAD: ${{ inputs.payload }}
+      GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8
+    steps:
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/.ghcup /usr/local/share/boost || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Parse payload SC bot
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys
+          try:
+              p = json.loads(os.environ["PAYLOAD"])
+          except Exception as e:
+              print(f"Invalid payload JSON: {e}")
+              sys.exit(1)
+          url = str(p.get("url", "")).strip()
+          asset_api = str(p.get("assetApiUrl", "") or "").strip()
+          mode = str(p.get("buildType", "release")).lower()
+          kind = str(p.get("kind", "")).lower()
+          if not url.startswith(("https://", "http://")) and not asset_api.startswith("https://"):
+              sys.exit("Invalid source URL in payload")
+          if mode in ("genetik", "genetic"):
+              mode = "release"
+          if mode not in ("debug", "release"):
+              mode = "release"
+          force = "android" if kind in ("genetic", "genetik") else "auto"
+          def esc(s):
+              return str(s).replace("%", "%25").replace("\n", "%0A").replace("\r", "%0D")
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"SOURCE_URL={esc(url)}\n")
+              f.write(f"ASSET_API_URL={esc(asset_api)}\n")
+              f.write(f"BUILD_TYPE={mode}\n")
+              f.write(f"FORCE_TYPE={force}\n")
+          print(f"URL ok, ASSET_API={bool(asset_api)}, BUILD_TYPE={mode}, FORCE_TYPE={force}, kind={kind}")
+          PY
+
+      - name: Download source ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p input workspace output
+          download_ok=false
+
+          if [ -n "${ASSET_API_URL:-}" ]; then
+            echo "Download via API asset (authenticated)..."
+            for i in 1 2 3 4 5 6; do
+              HTTP=$(curl -sS -L -o input/source.zip -w "%{http_code}" \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/octet-stream" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                --connect-timeout 20 --max-time 600 \
+                "$ASSET_API_URL" || echo "000")
+              if [ "$HTTP" = "200" ] && [ -s input/source.zip ]; then
+                download_ok=true
+                break
+              fi
+              echo "API download attempt $i → HTTP $HTTP"
+              sleep 4
+            done
+          fi
+
+          if [ "$download_ok" != "true" ] && [ -n "${SOURCE_URL:-}" ]; then
+            echo "Download via browser URL (authenticated)..."
+            for i in 1 2 3 4 5; do
+              HTTP=$(curl -sS -L -o input/source.zip -w "%{http_code}" \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/octet-stream" \
+                -A "REY-BUILD-WORKER/1.0" \
+                --connect-timeout 20 --max-time 600 \
+                "$SOURCE_URL" || echo "000")
+              if [ "$HTTP" = "200" ] && [ -s input/source.zip ]; then
+                download_ok=true
+                break
+              fi
+              echo "Browser URL attempt $i → HTTP $HTTP"
+              sleep 3
+            done
+          fi
+
+          if [ "$download_ok" != "true" ] && [ -n "${SOURCE_URL:-}" ]; then
+            echo "Download public fallback..."
+            curl --fail --location --retry 3 --retry-delay 2 \
+              --connect-timeout 20 --max-time 600 \
+              -A "REY-BUILD-WORKER/1.0" \
+              "$SOURCE_URL" -o input/source.zip && download_ok=true || true
+          fi
+
+          if [ "$download_ok" != "true" ] || [ ! -s input/source.zip ]; then
+            echo "::error::Gagal download source ZIP (404/private?)."
+            echo "SOURCE_URL=${SOURCE_URL:-}"
+            echo "ASSET_API_URL=${ASSET_API_URL:-}"
+            exit 1
+          fi
+
+          if ! unzip -t input/source.zip >/dev/null 2>&1; then
+            echo "::error::File terdownload bukan ZIP valid:"
+            head -c 400 input/source.zip || true
+            exit 1
+          fi
+          unzip -q input/source.zip -d workspace
+
+          # Flatten single top-level folder
+          COUNT=$(find workspace -mindepth 1 -maxdepth 1 | wc -l)
+          if [ "$COUNT" -eq 1 ]; then
+            ONLY=$(find workspace -mindepth 1 -maxdepth 1 -type d | head -1 || true)
+            if [ -n "$ONLY" ]; then
+              shopt -s dotglob
+              mv "$ONLY"/* workspace/ 2>/dev/null || true
+              rmdir "$ONLY" 2>/dev/null || true
+            fi
+          fi
+          echo "Workspace tree:"
+          find workspace -maxdepth 4 -type f | sort | head -200
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          set -euo pipefail
+          sdkmanager "platform-tools" || true
+          sdkmanager "platforms;android-34" || true
+          sdkmanager "platforms;android-35" || true
+          sdkmanager "build-tools;34.0.0" || true
+          sdkmanager "build-tools;35.0.0" || true
+          yes | sdkmanager --licenses >/dev/null || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Detect project type
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          REQUESTED="${FORCE_TYPE:-auto}"
+          has_pubspec=false
+          has_gradle=false
+          has_html=false
+          if find workspace -type f -name "pubspec.yaml" -print -quit | grep -q .; then has_pubspec=true; fi
+          if find workspace -type f \( -name "gradlew" -o -name "settings.gradle" -o -name "settings.gradle.kts" -o -name "build.gradle" -o -name "build.gradle.kts" \) -print -quit | grep -q .; then has_gradle=true; fi
+          if find workspace -type f \( -name "index.html" -o -name "*.html" \) -print -quit | grep -q .; then has_html=true; fi
+
+          if [ "$REQUESTED" = "android" ]; then
+            if $has_gradle; then
+              echo "type=android" >> "$GITHUB_OUTPUT"
+              echo "Forced genetic → android"
+              exit 0
+            fi
+            if $has_pubspec; then
+              echo "type=flutter" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if $has_html; then
+              echo "type=webview" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "type=unknown" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if $has_pubspec; then echo "type=flutter" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if $has_gradle; then echo "type=android" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if $has_html; then echo "type=webview" >> "$GITHUB_OUTPUT"; exit 0; fi
+          echo "type=unknown" >> "$GITHUB_OUTPUT"
+
+      # ═══════════════════════════════════════════════════════════════
+      # FLUTTER BUILD
+      # ═══════════════════════════════════════════════════════════════
+      - name: Setup Flutter
+        if: steps.detect.outputs.type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Locate Flutter project
+        if: steps.detect.outputs.type == 'flutter'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$(find workspace -type f -name pubspec.yaml -print -quit | xargs -r dirname)"
+          if [ -z "$ROOT" ]; then echo "::error::pubspec.yaml tidak ditemukan."; exit 1; fi
+          echo "FLUTTER_PROJECT=$ROOT" >> "$GITHUB_ENV"
+
+      - name: Flutter pub get + build
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ env.FLUTTER_PROJECT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter pub get
+          if [ "${BUILD_TYPE}" = "debug" ]; then flutter build apk --debug; else flutter build apk --release; fi
+
+      - name: Collect Flutter APK
+        if: steps.detect.outputs.type == 'flutter'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          APK="$(find "$FLUTTER_PROJECT" -type f -path '*/build/*' -name '*.apk' -size +10k | head -1)"
+          if [ -z "$APK" ]; then echo "::error::APK Flutter tidak ditemukan."; exit 1; fi
+          cp "$APK" output/app.apk
+
+      # ═══════════════════════════════════════════════════════════════
+      # NATIVE ANDROID / GENETIC BUILD
+      # ═══════════════════════════════════════════════════════════════
+      - name: Generate app icons (genetic)
+        if: steps.detect.outputs.type == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SCRIPT="$(find workspace -maxdepth 5 -type f -name generate_icons.py -print -quit || true)"
+          if [ -n "${SCRIPT:-}" ]; then
+            (cd "$(dirname "$SCRIPT")" && python3 generate_icons.py) || echo "generate_icons skip"
+          fi
+
+      - name: Locate Android project
+        if: steps.detect.outputs.type == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT=""
+          if [ -f workspace/android/settings.gradle ] || [ -f workspace/android/settings.gradle.kts ]; then
+            ROOT="workspace/android"
+          elif [ -f workspace/android/gradlew ]; then
+            ROOT="workspace/android"
+          fi
+          if [ -z "$ROOT" ]; then
+            while IFS= read -r s; do
+              d="$(dirname "$s")"
+              if [ -f "$d/gradlew" ] || [ -f "$d/gradlew.bat" ]; then
+                ROOT="$d"; break
+              fi
+            done < <(find workspace -type f \( -name settings.gradle -o -name settings.gradle.kts \) | sort)
+          fi
+          if [ -z "$ROOT" ]; then
+            ROOT="$(find workspace -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit | xargs -r dirname || true)"
+          fi
+          if [ -z "$ROOT" ]; then
+            ROOT="$(find workspace -type f -name gradlew -print -quit | xargs -r dirname || true)"
+          fi
+          if [ -z "$ROOT" ]; then
+            while IFS= read -r bg; do
+              if grep -qE 'com\.android\.(application|library)' "$bg" 2>/dev/null; then
+                ROOT="$(dirname "$bg")"
+                parent="$(dirname "$ROOT")"
+                if [ -f "$parent/settings.gradle" ] || [ -f "$parent/settings.gradle.kts" ]; then ROOT="$parent"; fi
+                break
+              fi
+            done < <(find workspace -type f \( -name build.gradle -o -name build.gradle.kts \) | sort)
+          fi
+          if [ -z "$ROOT" ]; then
+            echo "::error::Project Android tidak ditemukan di ZIP."
+            find workspace -maxdepth 5 -type f | head -120
+            exit 1
+          fi
+          echo "ANDROID_PROJECT=$ROOT" >> "$GITHUB_ENV"
+          echo "Android root: $ROOT"
+          ls -la "$ROOT" | head -40
+
+      - name: Bootstrap Gradle wrapper
+        if: steps.detect.outputs.type == 'android'
+        working-directory: ${{ env.ANDROID_PROJECT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          GRADLE_VER="8.7"
+          if [ -f "gradle/wrapper/gradle-wrapper.properties" ]; then
+            VER="$(grep -oE 'gradle-[0-9.]+' gradle/wrapper/gradle-wrapper.properties | head -1 | sed 's/gradle-//' || true)"
+            [ -n "${VER:-}" ] && GRADLE_VER="$VER"
+          fi
+          mkdir -p gradle/wrapper
+
+          if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
+            echo "Downloading gradle-wrapper.jar..."
+            curl -fsSL "https://raw.githubusercontent.com/gradle/gradle/v${GRADLE_VER}.0/gradle/wrapper/gradle-wrapper.jar" \
+              -o gradle/wrapper/gradle-wrapper.jar \
+              || curl -fsSL "https://github.com/gradle/gradle/raw/v8.7.0/gradle/wrapper/gradle-wrapper.jar" \
+              -o gradle/wrapper/gradle-wrapper.jar \
+              || true
+          fi
+
+          if [ ! -f "./gradlew" ]; then
+            echo "Bootstrapping gradlew via local gradle install..."
+            if ! command -v gradle >/dev/null 2>&1; then
+              curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VER}-bin.zip" -o /tmp/gradle.zip
+              sudo unzip -q /tmp/gradle.zip -d /opt
+              sudo ln -sfn "/opt/gradle-${GRADLE_VER}/bin/gradle" /usr/local/bin/gradle
+            fi
+            gradle wrapper --gradle-version "$GRADLE_VER" || true
+          fi
+
+          if [ -f "gradle/wrapper/gradle-wrapper.properties" ]; then
+            sed -i -E "s#distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-${GRADLE_VER}-all.zip#" \
+              gradle/wrapper/gradle-wrapper.properties
+            cat gradle/wrapper/gradle-wrapper.properties
+          else
+            cat > gradle/wrapper/gradle-wrapper.properties <<EOF
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\\://services.gradle.org/distributions/gradle-${GRADLE_VER}-all.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          EOF
+          fi
+
+          [ -f "./gradlew" ] && chmod +x ./gradlew
+          ls -la gradle/wrapper/ || true
+          ls -la ./gradlew 2>/dev/null || true
+
+      - name: Prepare local.properties + release signing fallback
+        if: steps.detect.outputs.type == 'android'
+        working-directory: ${{ env.ANDROID_PROJECT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          if [ -n "${ANDROID_HOME:-}" ]; then
+            echo "sdk.dir=${ANDROID_HOME}" > local.properties
+          elif [ -n "${ANDROID_SDK_ROOT:-}" ]; then
+            echo "sdk.dir=${ANDROID_SDK_ROOT}" > local.properties
+          fi
+          cat local.properties || true
+
+          APP_BG=""
+          if [ -f "app/build.gradle" ]; then APP_BG="app/build.gradle"; fi
+          if [ -f "app/build.gradle.kts" ]; then APP_BG="app/build.gradle.kts"; fi
+          if [ -n "$APP_BG" ] && [ "${BUILD_TYPE}" = "release" ]; then
+            if ! grep -qE 'signingConfig\s+signingConfigs\.debug' "$APP_BG"; then
+              echo "Inject signingConfig.debug for release in $APP_BG"
+              if [[ "$APP_BG" == *.kts ]]; then
+                python3 - <<'PY'
+          import pathlib,re
+          p=pathlib.Path("app/build.gradle.kts")
+          t=p.read_text()
+          if "signingConfig" not in t and "buildTypes" in t:
+              t=re.sub(r'(release\s*\{)', r'\1\n            signingConfig = signingConfigs.getByName("debug")', t, count=1)
+              p.write_text(t)
+          PY
+              else
+                python3 - <<'PY'
+          import pathlib,re
+          p=pathlib.Path("app/build.gradle")
+          t=p.read_text()
+          if "signingConfig signingConfigs.debug" not in t and "buildTypes" in t:
+              t=re.sub(r'(release\s*\{)', r'\1\n            signingConfig signingConfigs.debug', t, count=1)
+              p.write_text(t)
+          PY
+              fi
+            fi
+          fi
+
+      - name: Build native Android APK
+        if: steps.detect.outputs.type == 'android'
+        working-directory: ${{ env.ANDROID_PROJECT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            GRADLE="./gradlew"
+          else
+            GRADLE="gradle"
+          fi
+          if [ "${BUILD_TYPE}" = "debug" ]; then
+            TASK="assembleDebug"
+          else
+            TASK="assembleRelease"
+          fi
+          echo "Running: $GRADLE --no-daemon $TASK"
+          set +e
+          $GRADLE --no-daemon --stacktrace "$TASK"
+          CODE=$?
+          set -e
+          if [ $CODE -ne 0 ] && [ "$TASK" = "assembleRelease" ]; then
+            echo "Release gagal — fallback assembleDebug..."
+            $GRADLE --no-daemon --stacktrace assembleDebug
+          elif [ $CODE -ne 0 ]; then
+            echo "Build gagal sekali — retry..."
+            $GRADLE --no-daemon --stacktrace --refresh-dependencies "$TASK"
+          fi
+
+      - name: Collect native Android APK
+        if: steps.detect.outputs.type == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          APK="$(find "$ANDROID_PROJECT" -type f -path '*/build/outputs/apk/*' -name '*.apk' -size +10k | head -1 || true)"
+          if [ -z "${APK:-}" ]; then
+            APK="$(find "$ANDROID_PROJECT" -type f -name '*.apk' -size +10k | head -1 || true)"
+          fi
+          if [ -z "${APK:-}" ]; then
+            echo "::error::APK Android tidak ditemukan."
+            find "$ANDROID_PROJECT" -name '*.apk' -print || true
+            find "$ANDROID_PROJECT" -type d -name outputs | head -20 || true
+            exit 1
+          fi
+          cp "$APK" output/app.apk
+          echo "APK: $APK ($(du -h output/app.apk | cut -f1))"
+
+      # ═══════════════════════════════════════════════════════════════
+      # WEBVIEW BUILD (HTML → APK via inline template)
+      # ═══════════════════════════════════════════════════════════════
+      - name: Build WebView APK from HTML
+        if: steps.detect.outputs.type == 'webview'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TPL="workspace/_rey_webview"
+          rm -rf "$TPL"
+          mkdir -p "$TPL/app/src/main/java/com/rey/webview"
+          mkdir -p "$TPL/app/src/main/assets"
+          mkdir -p "$TPL/gradle/wrapper"
+
+          # settings.gradle
+          cat > "$TPL/settings.gradle" << 'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "ReyWebView"
+          include ':app'
+          EOF
+
+          # root build.gradle
+          cat > "$TPL/build.gradle" << 'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.0' apply false
+          }
+          EOF
+
+          # gradle.properties
+          cat > "$TPL/gradle.properties" << 'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx4g
+          EOF
+
+          # app/build.gradle
+          cat > "$TPL/app/build.gradle" << 'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.rey.webview'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.rey.webview'
+                  minSdk 21
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      signingConfig signingConfigs.debug
+                  }
+                  debug { }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF
+
+          # AndroidManifest.xml
+          cat > "$TPL/app/src/main/AndroidManifest.xml" << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:allowBackup="true"
+                  android:label="ReyApp"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar"
+                  android:usesCleartextTraffic="true">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          # MainActivity.java
+          cat > "$TPL/app/src/main/java/com/rey/webview/MainActivity.java" << 'EOF'
+          package com.rey.webview;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          public class MainActivity extends Activity {
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  WebView wv = new WebView(this);
+                  WebSettings s = wv.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setAllowFileAccess(true);
+                  s.setAllowContentAccess(true);
+                  s.setLoadWithOverviewMode(true);
+                  s.setUseWideViewPort(true);
+                  wv.setWebViewClient(new WebViewClient());
+                  wv.loadUrl("file:///android_asset/index.html");
+                  setContentView(wv);
+              }
+          }
+          EOF
+
+          # Copy HTML + assets
+          shopt -s nullglob
+          for f in workspace/*.html workspace/*.htm workspace/*.css workspace/*.js; do
+            cp "$f" "$TPL/app/src/main/assets/" 2>/dev/null || true
+          done
+          shopt -u nullglob
+
+          # Copy subfolder assets if any
+          if [ -d workspace/assets ]; then
+            cp -r workspace/assets/* "$TPL/app/src/main/assets/" 2>/dev/null || true
+          fi
+
+          # Rename first HTML to index.html if needed
+          if [ ! -f "$TPL/app/src/main/assets/index.html" ]; then
+            FIRST=$(find "$TPL/app/src/main/assets" -maxdepth 1 -type f \( -name "*.html" -o -name "*.htm" \) | head -1)
+            if [ -n "$FIRST" ]; then
+              mv "$FIRST" "$TPL/app/src/main/assets/index.html"
+            fi
+          fi
+
+          if [ ! -f "$TPL/app/src/main/assets/index.html" ]; then
+            echo "::error::index.html tidak ditemukan di ZIP."
+            find workspace -type f -name "*.html" | head -20
+            exit 1
+          fi
+
+          echo "WebView template ready:"
+          ls -la "$TPL/app/src/main/assets/"
+
+          echo "ANDROID_PROJECT=$TPL" >> "$GITHUB_ENV"
+          echo "WEBVIEW_MODE=true" >> "$GITHUB_ENV"
+
+      - name: Bootstrap Gradle wrapper (WebView)
+        if: steps.detect.outputs.type == 'webview'
+        working-directory: ${{ env.ANDROID_PROJECT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          GRADLE_VER="8.7"
+          mkdir -p gradle/wrapper
+
+          if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
+            curl -fsSL "https://raw.githubusercontent.com/gradle/gradle/v${GRADLE_VER}.0/gradle/wrapper/gradle-wrapper.jar" \
+              -o gradle/wrapper/gradle-wrapper.jar || true
+          fi
+
+          if [ ! -f "./gradlew" ]; then
+            if ! command -v gradle >/dev/null 2>&1; then
+              curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VER}-bin.zip" -o /tmp/gradle.zip
+              sudo unzip -q /tmp/gradle.zip -d /opt
+              sudo ln -sfn "/opt/gradle-${GRADLE_VER}/bin/gradle" /usr/local/bin/gradle
+            fi
+            gradle wrapper --gradle-version "$GRADLE_VER" || true
+          fi
+
+          cat > gradle/wrapper/gradle-wrapper.properties <<EOF
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\\://services.gradle.org/distributions/gradle-${GRADLE_VER}-all.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          EOF
+
+          [ -f "./gradlew" ] && chmod +x ./gradlew
+
+      - name: Build WebView APK
+        if: steps.detect.outputs.type == 'webview'
+        working-directory: ${{ env.ANDROID_PROJECT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "sdk.dir=${ANDROID_HOME}" > local.properties
+          yes | sdkmanager --licenses >/dev/null || true
+          if [ "${BUILD_TYPE}" = "debug" ]; then
+            TASK="assembleDebug"
+          else
+            TASK="assembleRelease"
+          fi
+          ./gradlew --no-daemon --stacktrace "$TASK" || ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Collect WebView APK
+        if: steps.detect.outputs.type == 'webview'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          APK="$(find "$ANDROID_PROJECT" -type f -path '*/build/outputs/apk/*' -name '*.apk' -size +10k | head -1 || true)"
+          if [ -z "${APK:-}" ]; then
+            APK="$(find "$ANDROID_PROJECT" -type f -name '*.apk' -size +10k | head -1 || true)"
+          fi
+          if [ -z "${APK:-}" ]; then
+            echo "::error::APK WebView tidak ditemukan."
+            exit 1
+          fi
+          cp "$APK" output/app.apk
+          echo "APK: $APK ($(du -h output/app.apk | cut -f1))"
+
+      # ═══════════════════════════════════════════════════════════════
+      # FALLBACK: UNKNOWN
+      # ═══════════════════════════════════════════════════════════════
+      - name: Fail if unknown project
+        if: steps.detect.outputs.type == 'unknown'
+        run: |
+          echo "::error::Tipe project tidak dikenali."
+          echo "Butuh salah satu dari:"
+          echo "  - pubspec.yaml (Flutter)"
+          echo "  - settings.gradle / gradlew (Native Android)"
+          echo "  - index.html / *.html (WebView)"
+          find workspace -maxdepth 4 -type f | head -80
+          exit 1
+
+      - name: Verify output
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f output/app.apk ]; then
+            echo "::error::output/app.apk tidak ada."
+            exit 1
+          fi
+          echo "Output OK: $(du -h output/app.apk | cut -f1)"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: output/app.apk
+          if-no-files-found: error
+          retention-days: 2
