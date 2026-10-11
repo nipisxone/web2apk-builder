@@ -1,0 +1,100 @@
+name: Build Flutter Debug APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_url:
+        description: 'URL ZIP project Flutter'
+        required: true
+        type: string
+      app_name:
+        description: 'Nama aplikasi'
+        required: true
+        type: string
+      package_name:
+        description: 'Package name (contoh: com.reymd.myapp)'
+        required: true
+        type: string
+      priority:
+        description: 'owner / user'
+        required: false
+        default: 'user'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GRADLE_OPTS: -Dorg.gradle.caching=true -Dorg.gradle.parallel=true -Dorg.gradle.jvmargs=-Xmx4g
+      PROJECT_URL: ${{ inputs.project_url }}
+      APP_NAME: ${{ inputs.app_name }}
+      PKG_NAME: ${{ inputs.package_name }}
+    steps:
+      - name: Download & validate project
+        run: |
+          curl -fL --retry 3 -o project.zip "$PROJECT_URL"
+          mkdir -p project
+          unzip -q project.zip -d project
+          PUB=$(find project -name pubspec.yaml -not -path "*/build/*" | head -n 1)
+          if [ -z "$PUB" ]; then
+            echo "::error::ZIP bukan project Flutter (pubspec.yaml tidak ditemukan)"
+            exit 1
+          fi
+          echo "PROJECT_DIR=$(dirname "$PUB")" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Flutter disamakan dengan project (lock file: Dart >= 3.9 = Flutter 3.35)
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.35.0'
+          channel: stable
+          cache: true
+
+      - name: Prepare project
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter pub get
+          if [ ! -d android ]; then
+            flutter create --platforms=android .
+          fi
+          # applicationId & label sesuai input (groovy & kts)
+          for f in android/app/build.gradle android/app/build.gradle.kts; do
+            [ -f "$f" ] && sed -i -E "s/applicationId[[:space:]]*=?[[:space:]]*\"[^\"]*\"/applicationId = \"$PKG_NAME\"/" "$f" || true
+          done
+
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter build apk --debug
+
+      - name: Collect APK
+        run: |
+          set -euo pipefail
+          MAN="$PROJECT_DIR/android/app/src/main/AndroidManifest.xml"
+          RAW=$(grep -o 'android:label="[^"]*"' "$MAN" | head -n 1 | sed -E 's/.*="([^"]*)"/\1/' || true)
+          if [[ "$RAW" == @string/* ]]; then
+            KEY=${RAW#@string/}
+            RAW=$(grep -o "<string name=\"$KEY\">[^<]*</string>" "$PROJECT_DIR/android/app/src/main/res/values/strings.xml" 2>/dev/null | head -n 1 | sed -E 's/.*>([^<]*)<.*/\1/' || true)
+          fi
+          SAFE=$(echo "$RAW" | tr ' ' '_' | tr -cd 'A-Za-z0-9_-')
+          [ -z "$SAFE" ] && SAFE="app"
+          APK=$(find "$PROJECT_DIR/build/app/outputs/flutter-apk" -name "*.apk" | head -n 1 || true)
+          if [ -z "$APK" ]; then
+            echo "::error::Tidak ada APK yang terbentuk"
+            exit 1
+          fi
+          mkdir -p out
+          cp "$APK" "out/${SAFE}.apk"
+          echo "Nama dari AndroidManifest: ${SAFE}.apk"
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-debug
+          path: out/*.apk
+          retention-days: 3
