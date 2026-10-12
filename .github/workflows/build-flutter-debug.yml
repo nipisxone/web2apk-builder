@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       package_name:
-        description: 'Package name (contoh: com.reymd.myapp)'
+        description: 'Package name (contoh: com.xera.myapp)'
         required: true
         type: string
       priority:
@@ -79,6 +79,64 @@ jobs:
             [ -f "$f" ] && sed -i -E "s/applicationId[[:space:]]*=?[[:space:]]*\"[^\"]*\"/applicationId = \"$PKG_NAME\"/" "$f" || true
           done
 
+      # Adaptive icon (Android 8+): ikon ikut bentuk launcher (bulat/squircle), bukan kotak. Nama ikon diambil dari AndroidManifest. Kalau ikonnya sudah adaptive, dilewati.
+      - name: Adaptive icon
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          RES=android/app/src/main/res
+          MAN=android/app/src/main/AndroidManifest.xml
+          NAME=$(grep -o 'android:icon="@mipmap/[^"]*"' "$MAN" | head -n 1 | sed -E 's/.*@mipmap\/([^"]*)"/\1/' || true)
+          if [ -z "$NAME" ]; then NAME=ic_launcher; fi
+          echo "Nama ikon di manifest: $NAME"
+          if [ -f "$RES/mipmap-anydpi-v26/$NAME.xml" ]; then
+            echo "Ikon $NAME sudah adaptive, skip."
+            exit 0
+          fi
+          command -v convert >/dev/null 2>&1 || sudo apt-get install -y imagemagick >/dev/null 2>&1 || true
+          if ! command -v convert >/dev/null 2>&1; then
+            echo "ImageMagick tidak ada, skip adaptive icon."
+            exit 0
+          fi
+          SRC=""
+          for D in xxxhdpi xxhdpi xhdpi hdpi mdpi; do
+            if [ -f "$RES/mipmap-$D/$NAME.png" ]; then SRC="$RES/mipmap-$D/$NAME.png"; break; fi
+          done
+          if [ -z "$SRC" ]; then
+            echo "$NAME.png tidak ditemukan, skip adaptive icon."
+            exit 0
+          fi
+          # warna background = warna pojok ikon, supaya ikon yang punya background sendiri nyatu (nggak kelihatan kotak di dalam)
+          BG_HEX=$(convert "$SRC" -background white -alpha remove -depth 8 -crop 1x1+0+0 -format '%[hex:p{0,0}]' info: 2>/dev/null || true)
+          BG_COLOR="#FFFFFF"
+          if [ -n "$BG_HEX" ]; then BG_COLOR="#${BG_HEX:0:6}"; fi
+          FAIL=0
+          for FG in 108:mdpi 162:hdpi 216:xhdpi 324:xxhdpi 432:xxxhdpi; do
+            PX=${FG%%:*}; DPI=${FG##*:}; INNER=$((PX * 60 / 100))
+            mkdir -p "$RES/mipmap-$DPI"
+            convert "$SRC" -resize ${INNER}x${INNER} -background none -gravity center -extent ${PX}x${PX} "$RES/mipmap-$DPI/${NAME}_foreground.png" || FAIL=1
+          done
+          if [ "$FAIL" = "1" ]; then
+            echo "Gagal bikin foreground, skip adaptive icon."
+            rm -f "$RES"/mipmap-*/${NAME}_foreground.png
+            exit 0
+          fi
+          mkdir -p "$RES/mipmap-anydpi-v26" "$RES/values"
+          cat > "$RES/values/${NAME}_background.xml" << BG_EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="${NAME}_background">${BG_COLOR}</color>
+          </resources>
+          BG_EOF
+          cat > "$RES/mipmap-anydpi-v26/$NAME.xml" << ADAPT_EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/${NAME}_background"/>
+              <foreground android:drawable="@mipmap/${NAME}_foreground"/>
+          </adaptive-icon>
+          ADAPT_EOF
+          cp "$RES/mipmap-anydpi-v26/$NAME.xml" "$RES/mipmap-anydpi-v26/${NAME}_round.xml"
+          echo "Adaptive icon $NAME dibuat, background $BG_COLOR"
       - name: Build debug APK
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
