@@ -1,0 +1,124 @@
+// mediafire.js — upload hasil build (APK) ke MediaFire, pengganti GitHub Release
+// Alur sesuai dokumentasi resmi: https://www.mediafire.com/developers/core_api/1.4/upload/
+//  - <= 20 MB : upload/simple (1 request, binary di body)
+//  -  > 20 MB : upload/check (resumable=yes) -> upload/resumable per unit -> upload/poll_upload
+const axios = require('axios');
+const crypto = require('crypto');
+const config = require('./config');
+
+const API = 'https://www.mediafire.com/api/1.4';
+const SIMPLE_MAX = 20 * 1024 * 1024;
+const UNIT_RETRY = 3;
+const POLL_INTERVAL = 3000;
+const POLL_MAX = 600; // ~30 menit
+
+function sha256(buf) { return crypto.createHash('sha256').update(buf).digest('hex'); }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function safeName(n) { return String(n || 'file.apk').replace(/[^A-Za-z0-9._-]/g, '_'); }
+
+function ensureToken() {
+    const t = config.MEDIAFIRE_SESSION_TOKEN;
+    if (!t || !String(t).trim()) throw new Error('MEDIAFIRE_SESSION_TOKEN belum diisi di config.js');
+    return String(t).trim();
+}
+
+function parseBody(data) {
+    if (typeof data === 'string') { try { return JSON.parse(data); } catch (e) { return {}; } }
+    return data || {};
+}
+
+// Respons JSON MediaFire dibungkus di "response"
+async function mfCall(method, action, query = {}, body = null, headers = {}) {
+    const res = await axios({
+        method,
+        url: API + '/' + action + '.php',
+        params: { ...query, session_token: ensureToken(), response_format: 'json' },
+        data: body,
+        headers,
+        timeout: 600000,
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+        validateStatus: () => true
+    });
+    const r = parseBody(res.data).response || parseBody(res.data);
+    if (r.result !== 'Success') throw new Error(action + ': ' + (r.message || ('error ' + (r.error || r.result || res.status))));
+    return r;
+}
+
+async function pollUpload(key) {
+    for (let i = 0; i < POLL_MAX; i++) {
+        const r = await mfCall('get', 'upload/poll_upload', { key });
+        const d = r.doupload || (Array.isArray(r.douploads) && r.douploads[0]) || {};
+        if (d.fileerror) throw new Error('MediaFire fileerror ' + d.fileerror);
+        if (String(d.status) === '99' && d.quickkey) return d.quickkey;
+        await sleep(POLL_INTERVAL);
+    }
+    throw new Error('MediaFire belum selesai memproses file (timeout)');
+}
+
+async function uploadSimple(buf, name) {
+    const r = await mfCall('post', 'upload/simple', {}, buf, {
+        'Content-Type': 'application/octet-stream',
+        'x-filename': name,
+        'x-filesize': String(buf.length),
+        'x-filehash': sha256(buf)
+    });
+    const d = r.doupload || {};
+    if (!d.key) throw new Error('upload/simple tidak mengembalikan key');
+    return pollUpload(d.key);
+}
+
+async function uploadResumable(buf, name) {
+    const size = buf.length;
+    const fileHash = sha256(buf);
+    const chk = await mfCall('get', 'upload/check', { filename: name, size, hash: fileHash, resumable: 'yes' });
+    const ru = chk.resumable_upload;
+    if (!ru) {
+        if (chk.hash_exists === 'yes') {
+            const inst = await mfCall('post', 'upload/instant', { filename: name, size, hash: fileHash });
+            if (inst.quickkey) return inst.quickkey;
+        }
+        throw new Error('upload/check tidak mengembalikan resumable_upload');
+    }
+    const unitSize = Number(ru.unit_size), units = Number(ru.number_of_units);
+    let key = null, last = null;
+    for (let id = 0; id < units; id++) {
+        const chunk = buf.subarray(id * unitSize, Math.min((id + 1) * unitSize, size));
+        let ok = false, lastErr = null;
+        for (let a = 1; a <= UNIT_RETRY && !ok; a++) {
+            try {
+                last = await mfCall('post', 'upload/resumable', {}, chunk, {
+                    'Content-Type': 'application/octet-stream',
+                    'x-filename': name,
+                    'x-filesize': String(size),
+                    'x-filehash': fileHash,
+                    'x-unit-hash': sha256(chunk),
+                    'x-unit-id': String(id),
+                    'x-unit-size': String(chunk.length)
+                });
+                key = (last.doupload && last.doupload.key) || key;
+                ok = true;
+            } catch (e) { lastErr = e; await sleep(1500 * a); }
+        }
+        if (!ok) throw new Error('unit ' + id + ' gagal: ' + (lastErr && lastErr.message));
+    }
+    const ready = last && last.resumable_upload && last.resumable_upload.all_units_ready;
+    if (ready !== 'yes') throw new Error('MediaFire belum menerima semua unit (all_units_ready=' + ready + ')');
+    if (!key) throw new Error('key upload tidak ditemukan');
+    return pollUpload(key);
+}
+
+// Hasil: { success, url, quickkey } atau { success:false, error }
+async function uploadToMediaFire(buffer, filename) {
+    try {
+        const name = safeName(filename);
+        const quickkey = buffer.length <= SIMPLE_MAX
+            ? await uploadSimple(buffer, name)
+            : await uploadResumable(buffer, name);
+        return { success: true, quickkey, url: 'https://www.mediafire.com/file/' + quickkey };
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+module.exports = { uploadToMediaFire };
